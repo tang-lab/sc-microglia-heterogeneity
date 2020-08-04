@@ -1,0 +1,614 @@
+---
+title: "Comparative DropSeq Analysis of 2,4, 8 month Wt & Tg Mouse Brain & Spinal Cells"
+author: "JTA & Mike"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    highlight: haddock
+    theme: yeti
+    toc_float: no
+editor_options: 
+  chunk_output_type: console
+---
+
+ 
+<style>
+.scroll{
+    height: 360px;
+    width: 100%;
+    overflow-y: scroll;
+}
+</style>
+
+```{css, echo=FALSE}
+div.sourceCode {
+  overflow-x: hidden;
+}
+
+```
+
+```{r setup, include=FALSE}
+# Setup
+# setRepositories() # Choose repositories to download packages
+#install.packages("/home/pogo/Downloads/Seurat-2.2.1/",repos=NULL,type="source")
+library("Seurat")
+
+pkgs <- c("harmony","knitr", "DT", "kableExtra", "RColorBrewer", "Seurat", "dplyr", "scater",
+          "Matrix", "cowplot","readxl","openxlsx","ggrepel","monocle")
+
+lapply(pkgs, library, character.only = T)
+
+#Modified to reflect different working environment
+#opts_knit$set(root.dir = "~/R/Junying/MouseSpinalCord/2monMsSPTgvsWt08.13.17/doc/")
+
+dirs<-vector(mode = "list",length=6)
+dirs[[1]]<-"/home/pogo/Desktop/Junying_Analysis/Microglial_Cd83_analysis/everything_mcgOnly/doc/"
+
+opts_knit$set(root.dir = dirs[[1]])
+
+opts_chunk$set(cache = FALSE, echo = TRUE, fig.align = "center", fig.width = 12,
+               fig.height = 6, message = FALSE, warning = FALSE, eval = FALSE)
+
+setwd(opts_knit$get("root.dir"))
+dir.create("../results/fig", showWarnings = FALSE)
+
+```
+
+
+## Data Processing
+Data was available as DropSeq FASTQ files. In order to be analyzed using the [*R* package **Seurat**](http://www.nature.com/nbt/journal/v33/n5/full/nbt.3192.html), the files were preprocessed as described in the latest [computational protocol from the McCarroll lab](http://mccarrolllab.com/wp-content/uploads/2016/
+03/Drop-seqAlignmentCookbookv1.2Jan2016.pdf), using Picard, STAR, and other programs found in their [Drop-seq toolkit](http://mccarrolllab.com/download/922/). Then, the pipelines as demonstrated in the [Seurat guided clustering tutorial](http://satijalab.org/seurat/pbmc-tutorial.html) and [Seurat guided alignment tutorial](http://satijalab.org/seurat/immune_alignment.html) were executed, modifying only when necessary.
+
+
+### Seurat preprocessing step
+- Determine filter criteria based on cell/gene count distributions.
+```{r Seurat-preprocessing-1}
+# Load data
+fls <- list.files("../data", recursive = T, full.names = T,pattern = "out_gene_exon_tagged_cleaned.dge.txt.gz")
+
+dat <- lapply(fls, read.table, header = T, row.names = 1) 
+names(dat) <- gsub(".+data/(.+)/.+", "\\1", fls)
+
+
+# Load canonical marker genes
+cmGenes <- read.csv("../data/CellTypes-MarkerGenes.csv", header = T, fill = T, stringsAsFactors = F)
+cmGenes <- as.list(cmGenes[,-1])
+cmGenes <- lapply(cmGenes, function(x) x[x != ""])
+
+
+# Tabulate canonical marker gene expression
+tbl <- stack(cmGenes)
+colnames(tbl) <-  c("geneID","cellType")
+tbl <- do.call(cbind, list(tbl, 
+                           nCells. = lapply(dat, function(x) rowSums(x[tbl$geneID,] > 0)),
+                           meanCts. = lapply(dat, function(x) {
+                                                     y <- x[tbl$geneID,]
+                                                     y[y == 0] <- NA
+                                                     return(rowMeans(y, na.rm = T))
+                                                   })))
+rownames(tbl) <- NULL
+saveRDS(tbl, file = "../results/cmGeneTbl.Rds")
+
+
+# Display nGenes and nCells distribution across cells
+png("../results/fig/rawDataDistr.png", width = 12, height = 8, units = "in", res = 300)
+par(mfrow = c(4,3), mar = c(5.1, 4.1, 2.1, 1.1))
+for (i in names(dat)) {
+  hist(log2(colSums(dat[[i]] > 0)), "fd", xlab = expression("log"[2]*"(nGenes per cell)"), main = i)
+  hist(log2(rowSums(dat[[i]] > 0)), "fd", xlab = expression("log"[2]*"(nCells per gene)"), main = i)
+}
+dev.off()
+
+```
+
+
+![](../results/fig/rawDataDistr.png)
+
+- Establish filter criteria based on gene and UMI abundances as well as mitochondrial gene percentages after initial filtering. 
+```{r Seurat-preprocessing-2}
+for (i in names(dat)) {
+  # Generate Seurat class object from data passing filter criteria
+  dat[[i]] <- CreateSeuratObject(raw.data = dat[[i]], min.cells = 30, min.genes = 300, project = i)
+  
+  # Get % of UMI mapping to MT-genes; mouse MT-genes were taken from the Mitocarta website
+  mito.genes <- read_excel("../data/Mouse.MitoCarta2.0.xlsx", sheet = "A Mouse MitoCarta2.0")
+  mito.genes <- mito.genes[c("Symbol","Synonyms")]
+  mito.genes <- unlist(strsplit(unlist(mito.genes, use.names = F), "\\|"))
+  mito.genes <- rownames(dat[[i]]@data)[rownames(dat[[i]]@data) %in% mito.genes]
+  percent.mito <- colSums(dat[[i]]@data[mito.genes,])/colSums(dat[[i]]@data)
+  
+  #Add percent.mito to dat@meta.data then plot distributions
+  dat[[i]] <- AddMetaData(dat[[i]], percent.mito, "percent.mito")  
+}
+
+
+# Plot meta data against each other
+png("../results/fig/GenePlot.png", width = 12, height = 12, units = "in", res = 300)
+par(mfrow = c(6,2), oma = c(0,3,0,0))
+for (i in names(dat)) {
+  GenePlot(dat[[i]], "nUMI", "percent.mito")
+  mtext(i, side = 2, line = 5)
+  GenePlot(dat[[i]], "nUMI", "nGene")
+}
+dev.off()
+
+```
+
+![](../results/fig/GenePlot.png)
+\
+\
+
+
+- Prepare data pca.
+    - Filter out cells based on thresholds for UMI and % mitochodrial genes.
+    - Perform log-normalization.
+    - Center and scale gene expression.
+```{r Seurat-preprocessing-3}
+# Define gates for filtering 
+dat <- lapply(dat, FilterCells, subset.names = c("nUMI", "percent.mito"), low.thresholds = c(200,0), high.thresholds = c(3000,0.1))
+
+#return sum of all cell counts in each dataset
+count = 0;
+i=1
+for(q in dat){
+  #print(nrow(q@meta.data))
+  print(names(dat)[[i]])
+  print(nrow(q@meta.data))
+  count = count + nrow(q@meta.data)
+  i=i+1
+}
+print(count)
+
+# Perform log-normalization
+dat <- lapply(dat, NormalizeData)
+
+# Scale data
+dat <- lapply(dat, ScaleData, vars.to.regress = c("nUMI","percent.mito"))
+
+#save dataset names
+datasetNames <- names(dat)
+
+```
+
+```{r Seurat-varGenes-PCA-and-clustering-1}
+saveRDS(dat,"dat.beforecalcGeneDisperions.rds")
+
+#rename datasets to exclude "/"
+q=1
+for(i in names(dat)){
+  posOfSlash<-regexpr(pattern = "/",text=names(dat)[[q]])
+  if(posOfSlash>0){
+  newStr<-substr(x = names(dat)[[q]],start = 0,stop = posOfSlash-1)
+  names(dat)[[q]]<-newStr
+  dat[[q]]@project.name<-newStr
+  dat[[q]]@meta.data$orig.ident<-newStr
+  }
+  q=q+1
+}
+q=1
+
+#jackstraw, etc
+
+# Calculate gene dispersions
+q=1#start counter
+for(i in names(dat)){
+  name1<-paste0("../results/fig/VariableGenePlot_",i)
+  name<-paste0(name1,".png")
+  png(name, width = 12, height = 6, units = "in", res = 300)
+	dat[[q]] <- FindVariableGenes(dat[[q]], mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, y.high.cutoff = 6, do.plot = T)
+	dev.off()
+	q=q+1
+}
+q=1#reset counter
+	
+	#do jackstraw calculation
+	for(i in 1:length(dat)){
+	  print(i)
+	  dat[[i]] <- RunPCA(dat[[i]], pc.genes = dat[[i]]@var.genes, do.print = F, pcs.compute = 30)
+	  dat[[i]] <- JackStraw(dat[[i]], num.replicate = 100, num.pc = 30)
+	}
+
+  jsplt<-list()
+	#create jackstraw plots
+	for(i in 1:length(dat)){
+	  print(i)
+	  jsplt[[i]]<-JackStrawPlot(object = dat[[i]], PCs = 1:30)	
+	}
+
+	#print jackstraw plots
+q=1#set counter
+	for( i in names(dat)){
+	   name1<-paste0("../results/fig/JackStrawPlot_",i)
+     name<-paste0(name1,".png")
+     png(name, width = 12, height = 15, units = "in", res = 300)
+     plot<-jsplt[[q]]
+     print(plot)
+     dev.off()
+     q=q+1#increment counter
+	}
+q=1#reset counter
+
+	# Cluster cells
+	pca.dims<-list()
+	
+sigPCs <- function(JackStrawPlot_object, threshold = 0.05) {
+    pc <- strsplit(gsub("^PC", "",as.character(unique(JackStrawPlot_object$data$PC.Score))),
+                   split = " ")
+    pc <- data.frame(PC = as.numeric(sapply(pc, "[[", 1)), 
+                     pval = as.numeric(sapply(pc, "[[", 2), stringsAsFactors = F))
+    
+    return(pc[which(pc$pval <= threshold), "PC"])
+}
+
+
+	for(i in 1:length(dat)){
+	  pca.dims[[i]]<-sigPCs(jsplt[[i]], threshold = 0.001)
+	}
+
+saveRDS(dat,"dat.beforeTSNE.rds")
+
+	#run TSNE and find clusters
+	for(i in 1:length(dat)){
+
+	  print(i)
+	  dat[[i]] <- RunTSNE(dat[[i]], dims.use = pca.dims[[i]], do.fast = T)
+	  print("done tsne")
+	  #dat[[i]]
+	 dat[[i]]  <- FindClusters(dat[[i]], reduction.type = "pca", dims.use = pca.dims[[i]], resolution = 0.6,
+		            print.output = F, save.SNN = T, random.seed = 1234, force.recalc = F)
+	}
+	
+#checkpoint
+saveRDS(object = dat,"dat.afterClustering.rds")
+
+# Specify the resolution to view clustered data in
+orig.id <- "res.0.6"
+for(i in 1:length(dat)){
+  dat[[i]] <- SetAllIdent(dat[[i]], id = orig.id)
+}
+
+	#generate tsne plot
+	q=1#set counter
+	for( i in names(dat)){
+	   name1<-paste0("../results/fig/tsne_",i)
+     name<-paste0(name1,".png")
+     png(name, width = 8, height = 6, units = "in", res = 300)
+     plot<-TSNEPlot(dat[[q]],do.label=T)
+     print(plot)
+     dev.off()
+     q=q+1#increment counter
+	}
+q=1#reset counter
+
+  for(i in 1:length(dat)){
+	   colnames(dat[[i]]@meta.data)<-c("nGene","nUMI","orig.ident","percent.mito","orig.clust.id")
+  }
+
+q=1#set counter
+	for( i in names(dat)){
+	   name1<-paste0("../results/fig/mcg_VlnPlot_",i)
+     name<-paste0(name1,".png")
+     png(name, width = 12, height = 8, units = "in", res = 300)
+     plot<-VlnPlot(object = dat[[q]],features.plot = c("Cx3cr1","P2ry12","Tmem119"))
+     print(plot)
+     dev.off()
+     q=q+1#increment counter
+	}
+q=1#reset counter
+saveRDS(dat,"dat.afterTSNE_VlnPlots.rds")
+
+```
+
+![](../results/fig/TSNEPlot_dat.all.cca.png)
+\
+\
+
+
+```{r subset-mcg}
+#2monbrwt: 0,2,9
+#2monbrtg: 0,1,3,7,8
+
+#2monspwt: 0,2
+#2monsptg:0,1,2,12
+
+#4monbrwt: 0,2,3,6
+#4monbrtg: 0,1,2,3,5,9
+
+#4monspwt: 0,2,3
+#4monsptg: 0,1,2,4,12
+
+#8monbrwt:0,3,6
+#8monbrtg:0,1,2,4,5,6
+
+#8monspwt: 0,1,8
+#8monsptg: 0,1,2
+
+#verify ordering of datasets
+names(dat)
+
+
+wt_2mo_br_astro_cluster <- c(0,2,9)#
+tg_2mo_br_astro_cluster <- c(0,1,3,7,8)#
+
+wt_2mo_sp_astro_cluster <- c(0,2)#
+tg_2mo_sp_astro_cluster <- c(0,1,2,12)#
+
+wt_4mo_br_astro_cluster <- c(0,1,5)#
+tg_4mo_br_astro_cluster <- c(0,1,2,3,5,9)#
+
+wt_4mo_sp_astro_cluster <- c(0,2,3)#
+tg_4mo_sp_astro_cluster <- c(0,1,2,4,12,14)#
+
+wt_8mo_br_astro_cluster <- c(0,3,6)#
+tg_8mo_br_astro_cluster <- c(0,1,2,4,5,7)#
+
+wt_8mo_sp_astro_cluster <- c(0,1,8)#
+tg_8mo_sp_astro_cluster <- c(0,1,2)#
+
+clusters<-list(
+  tg_2mo_br_astro_cluster,
+  wt_2mo_br_astro_cluster,
+  tg_2mo_sp_astro_cluster,
+  wt_2mo_sp_astro_cluster,
+  tg_4mo_br_astro_cluster,
+  wt_4mo_br_astro_cluster,
+  tg_4mo_sp_astro_cluster,
+  wt_4mo_sp_astro_cluster,
+  tg_8mo_br_astro_cluster,
+  wt_8mo_br_astro_cluster,
+  tg_8mo_sp_astro_cluster,
+  wt_8mo_sp_astro_cluster
+  )
+
+subset_rownames<-list()
+
+for(i in 1:length(clusters)){
+  isMicrogliaCell<-dat[[i]]@meta.data$orig.clust.id%in%clusters[[i]]#Identifies which rows (cells) in the dataset are in the specified clusters
+  subset_rownames[[i]]<-row.names(subset(dat[[i]]@meta.data,isMicrogliaCell))#store the rownames that correspond to microglia
+}
+
+  dat.astrosubset<-list()
+
+for(i in 1:length(subset_rownames)){
+  dat.astrosubset[[i]]<-SubsetData(dat[[i]],cells.use = subset_rownames[[i]])
+}
+
+
+```
+
+```{r analyze}
+  astroOnly<-list()
+    
+    astroOnly<-lapply(X = dat.astrosubset,FUN = NormalizeData)
+    
+    astroOnly<-lapply(X = astroOnly,FUN = ScaleData, vars.to.regress=c("nUMI","percent.mito"))
+    
+    astroOnly<-lapply(X = astroOnly,FUN = FindVariableGenes, mean.function = ExpMean, dispersion.function = LogVMR,
+		x.low.cutoff = 0.0125, x.high.cutoff = 3,y.cutoff = 0.5, y.high.cutoff = 6)
+    
+    print("Started loop")
+  for(i in 1:length(astroOnly)){
+    print(paste0("Working on ",names(dat)[[i]]))
+    astroOnly[[i]]<-RunPCA(object = astroOnly[[i]],pc.genes=astroOnly[[i]]@var.genes,pcs.compute=30)
+    #print("Working on jackstraw")
+    astroOnly[[i]]<-JackStraw(object = astroOnly[[i]],num.replicate=100,num.pc=30)
+    
+    jsplt[[i]]<-JackStrawPlot(object = astroOnly[[i]], PCs = 1:30)
+    
+	  pca.dims[[i]]<-sigPCs(jsplt[[i]], threshold = 0.001)
+
+    print("Generating tSNE")
+    astroOnly[[i]]<-RunTSNE(object = astroOnly[[i]],reduction.use="pca",dims.use=pca.dims[[i]],do.fast=T)
+    print("Finding clusters")
+    astroOnly[[i]]<-FindClusters(object = astroOnly[[i]],reduction.type="pca",dims.use=pca.dims[[i]],resolution=0.6,save.SNN=T,random.seed=1234,force.recalc = T)
+    
+    datasetName<-names(dat)[[i]]
+    png(paste0("../results/fig/astroOnly_tSNEPlot_",datasetName,".png"),height=10,width=10,res=300,units="in")
+    TSNEPlot(object = astroOnly[[i]],do.label = T,pt.size = 0.5)
+    dev.off()
+    
+
+  }
+    
+  saveRDS(astroOnly,"astroOnly.rds")
+    
+```
+
+
+```{r renameCells}
+#rename cells to avoid any potential conflict
+#add prefix to cell names
+q=1
+for (i in names(dat)) {
+  colnames(astroOnly[[q]]@data) <- paste(i, colnames(astroOnly[[q]]@data), sep = ".")
+  colnames(astroOnly[[q]]@raw.data) <- paste(i, colnames(astroOnly[[q]]@raw.data), sep = ".")
+  colnames(astroOnly[[q]]@scale.data) <- paste(i, colnames(astroOnly[[q]]@scale.data), sep = ".")
+  rownames(astroOnly[[q]]@meta.data) <- paste(i, rownames(astroOnly[[q]]@meta.data), sep = ".")
+  astroOnly[[q]]@cell.names <- paste(i, astroOnly[[q]]@cell.names, sep = '.')
+  q=q+1
+}
+```
+
+```{r multiCCA}
+ hvg.list<-list()  
+count = 0
+for(i in 1:length(astroOnly)){
+  astroOnly[[i]]<-FindVariableGenes(object = astroOnly[[i]],do.plot=F)
+  hvg.list[[i]]<-rownames(x=head(x=astroOnly[[i]]@hvg.info,n=4000))
+  print(nrow(astroOnly[[i]]@meta.data))
+  count = count + nrow(astroOnly[[i]]@meta.data)
+}
+print(count)
+
+hvg.intersect<-Reduce(intersect,hvg.list)
+hvg.intersect<-head(hvg.intersect,n=4000)
+
+combined_mcg<-RunMultiCCA(object.list = astroOnly,genes.use = unique(hvg.intersect),num.ccs = 10)
+
+saveRDS(combined_mcg,"combined_mcg.rds")
+
+combined_mcg@meta.data[,3]<-gsub("\\..*","",combined_mcg@meta.data[,3])#gsub("^[^.]*\\.","",combined_mcg@meta.data[,3])
+
+combined_mcg<-SetAllIdent(object = combined_mcg,"orig.ident")
+
+DimHeatmap(object = combined_mcg, reduction.type = "cca", cells.use = 500, dim.use = 1:10, do.balanced = TRUE)
+
+
+
+combined_mcg <- CalcVarExpRatio(object = combined_mcg, reduction.type = "pca", grouping.var = "orig.ident", dims.use = 1:10)
+
+combined_mcg.bkp<-combined_mcg
+combined_mcg <- SubsetData(object = combined_mcg, subset.name = "var.ratio.pca", accept.low = 0.5)
+
+combined_mcg <- AlignSubspace(object = combined_mcg, reduction.type = "cca", grouping.var = "orig.ident", dims.align = 1:10)
+
+saveRDS(combined_mcg,"combined_mcg_afterAlign.rds")
+
+combined_mcg <- RunTSNE(object = combined_mcg, reduction.use = "cca.aligned", dims.use = 1:10, do.fast = TRUE)
+combined_mcg <- FindClusters(object = combined_mcg, reduction.type = "cca.aligned", dims.use = 1:10, save.SNN = TRUE)
+
+combined_mcg<-FindVariableGenes(object = combined_mcg,do.plot=F)
+
+#add wt/tg column, brain/sp
+#append column to temp
+temp<-combined_mcg@meta.data
+temp[,9]<-"a"
+temp[,10]<-"b"
+temp[,11]<-"c"
+for(i in 1:nrow(combined_mcg@meta.data)){
+ 
+  row<-temp[i,]
+  rowname<-row.names(row)
+  
+  isBr<-regexpr(pattern = "Br",text=rowname)
+  isSp<-regexpr(pattern = "Sp",text=rowname)
+  
+  isWt<-regexpr(pattern = "Wt",text=rowname)
+  if(isBr>0){
+    isTg<-regexpr(pattern = "Tg",text=rowname)
+  }
+  if(isSp>0){
+    isTg<-regexpr(pattern = "120",text=rowname)
+  }
+  is2<-regexpr(pattern = "2",text=rowname)
+  is4<-regexpr(pattern = "4",text=rowname)
+  is8<-regexpr(pattern = "8",text=rowname)
+  
+  if(isBr < 0 & isSp < 0){
+    print("Could not determine whether cell is br or sp")
+  }
+  if(isWt < 0 & isTg < 0){
+    print("Could not determine whether cell is wt or tg")
+  }
+  
+  if(isBr>0){
+    row[,9]<-"br"
+  }
+  if(isSp>0){
+    row[,9]<-"sp"
+  }
+  
+  if(isWt>0){
+    row[,10]<-"wt"
+  }
+  if(isTg>0){
+    row[,10]<-"tg"
+  }
+  
+  if(is2 > 0){
+    row[,11]<-"2mo"
+  }
+  if(is4 > 0){
+    row[,11]<-"4mo"
+  }
+  if(is8 > 0){
+    row[,11]<-"8mo"
+  }
+  
+  '#
+  if(is2 > 0 & isBr > 0 & isTg > 0){
+    row[3]<-"2moBrTg"
+  }
+  if(is2 > 0 & isBr > 0 & isWt > 0){
+    row[3]<-"2moBrWt"
+  }
+  if(is2 > 0 & isSp > 0 & isTg > 0){
+    row[3]<-"2moSpTg"
+  }
+  if(is2 > 0 & isSp > 0 & isWt > 0){
+    row[3]<-"2moSpWt"
+  }
+  
+  if(is4 > 0 & isBr > 0 & isTg > 0){
+    row[3]<-"4moBrTg"
+  }
+  if(is4 > 0 & isBr > 0 & isWt > 0 ){
+    row[3]<-"4moBrWt"
+  }
+  if(is4 > 0 & isSp > 0 & isTg > 0){
+    row[3]<-"4moSpTg"
+  }
+  if(is4 > 0 & isSp > 0 & isWt > 0){
+    row[3]<-"4moSpWt"
+  }
+  
+  if(is8 > 0 & isBr > 0 & isTg > 0){
+    row[3]<-"8moBrTg"
+  }
+  if(is8 > 0 & isBr > 0 & isWt > 0){
+    row[3]<-"8moBrWt"
+  }
+  if(is8 > 0 & isSp > 0 & isTg > 0){
+    row[3]<-"8moSpTg"
+  }
+  if(is8 > 0 & isSp > 0 & isWt > 0){
+    row[3]<-"8moSpWt"
+  }#'
+  
+  temp[i,]<-row
+}
+colnames(temp)<-c("nGene", "nUMI", "orig.ident", "percent.mito", "orig.clust.id", "res.0.6", "var.ratio.pca", "res.0.8", "tissue", "type","time")
+combined_mcg@meta.data<-temp
+```
+
+```{r generateFigs, eval=FALSE, include=FALSE}
+saveRDS(combined_mcg,"combined_mcg_beforeFig.rds")
+
+
+'#shorten identities
+"2monMsBrTg"  -->  "2mBrTg"
+"2monMsBrWt"  -->  "2mBrWt"
+"2monMsSpWt"  -->  "2mSpWt"
+"2monMsSp120" -->  "2mSpTg"
+"4monMsBrTg"  -->  "4mBrTg"
+"4monMsBrWt"  -->  "4mBrWt"
+"4monMsSp120" -->  "4mSpTg"
+"4monMsSpWt"  -->  "4mSpWt"
+"8monMsBrTg"  -->  "8mBrTg"
+"8monMsBrWt"  -->  "8mBrWt"
+"8monMsSp120" -->  "8mSpTg"
+"8monMsSpWt"  -->  "8mSpWt"
+#'
+
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "2monMsBrTg",replacement = "2mBrTg")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "2monMsBrWt",replacement = "2mBrWt")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "2monMsSp120",replacement = "2mSpTg")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "2monMsSpWt",replacement = "2mSpWt")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "4monMsSp120",replacement = "4mSpTg")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "4monMsBrTg",replacement = "4mBrTg")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "4monMsBrWt",replacement = "4mBrWt")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "4monMsSpWt",replacement = "4mSpWt")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "8monMsBrTg",replacement = "8mBrTg")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "8monMsBrWt",replacement = "8mBrWt")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "8monMsSp120",replacement = "8mSpTg")
+combined_mcg@meta.data[,3]<-gsub(x = combined_mcg@meta.data[,3],pattern = "8monMsSpWt",replacement = "8mSpWt")
+
+combined_mcg<-SetAllIdent(object = combined_mcg,id = "orig.ident")
+
+png(filename = "heatmap.png",width = 16,height=8,units="in",res=300)
+DoHeatmap(object = combined_mcg,genes.use = c("Cx3cr1","P2ry12","Tmem119","Hexb","Ctsd","Csf1r","Atf3","Egr1","Btg2","Ier2", "Nfkbiz","Cd83","Ccl4","Cd14","Ccl3","Il1a","Il1b", "Gpr84", "Cd14","Casp4","Ccl3","Il1b","Tnf","Cd14", "Gpr84", "Casp4", "H2-Ab1","Igf1","Csf1","Axl","Lpl","Itgax", "Cd74","Cst7","Lgals3","Ccl12", "Ifi204","Ifit2", "Ifit3","Rtp4","Irf7","Ccl12","Slfn5","Slfn2","Slfn5","Slfn2", "Top2a", "Smc4","Cenpe","Kif23","Kif15" ,"Mki67","Kif23", "Cdk1", "Cenpf", "Ube2c", "Ckap2l", "Birc5", "Tpx2"), col.low = "black",col.mid = "light gray",
+  col.high = "red",slim.col.label = T, disp.min = -2.5, disp.max = 2.5, group.by = "orig.ident",group.label.rot = T,group.spacing = 0.2, group.order = c("2mSpWt","2mSpTg","4mSpWt","4mSpTg","8mSpWt","8mSpTg","2mBrWt","2mBrTg","4mBrWt","4mBrTg","8mBrWt","8mBrTg"))
+dev.off()
+```

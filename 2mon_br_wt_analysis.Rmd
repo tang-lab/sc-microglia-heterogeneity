@@ -1,0 +1,769 @@
+---
+title: "DropSeq Analysis of Mouse Two-month Old Wt Brain Cells"
+author: "JTA"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  word_document: default
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    highlight: haddock
+    theme: yeti
+    toc_float: no
+editor_options:
+  chunk_output_type: console
+---
+
+
+<style>
+.scroll{
+    height: 360px;
+    width: 100%;
+    overflow-y: scroll;
+}
+</style>
+
+```{r setup, include=FALSE}
+# Setup
+#setRepositories() # Choose repositories to download packages
+#Install MAST
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("MAST")
+#install.packages("MAST")
+#library(MAST)
+
+'#
+Directory structure
+(Project Folder)
+  -->data
+    -->2mon_br_wt
+        -->out_gene_exon_tagged_cleaned.dge.txt.gz
+    -->Mouse.MitoCarta2.0.xlsx
+  -->doc
+    -->project.Rproj
+  -->results
+    -->fig
+
+#'
+
+pkgs <- c("knitr","DT","kableExtra","RColorBrewer","dplyr", "Seurat", "DT", 
+          "Matrix","corrplot","RColorBrewer","pbapply","parallel","grid","openxlsx")
+
+lapply(pkgs, library, character.only = T)
+
+
+
+#Update the path to your the directory your working in
+opts_knit$set(root.dir = "~/Dekstop/Junying_analysis/2mon_br_wt/doc")
+
+opts_chunk$set(cache = FALSE, echo = TRUE, fig.align = "center", fig.width = 12,fig.height = 6, message = FALSE, warning = FALSE, eval = FALSE, collapse = T)
+
+setwd(opts_knit$get("root.dir"))
+dir.create("../results/fig", showWarnings = FALSE)
+
+```
+
+## Data Processing
+Data was available as DropSeq FASTQ files. In order to be analyzed using the [*R* package **Seurat**](http://www.nature.com/nbt/journal/v33/n5/full/nbt.3192.html), the files were preprocessed as described in the latest [computational protocol from the McCarroll lab](http://mccarrolllab.com/wp-content/uploads/2016/
+03/Drop-seqAlignmentCookbookv1.2Jan2016.pdf), using Picard, STAR, and other programs found in their [Drop-seq toolkit](http://mccarrolllab.com/download/922/). Then, the pipeline as demonstrated in the [Seurat guided tutorial](http://satijalab.org/seurat/pbmc-tutorial.html) was executed, modifying only when necessary. Additional analyses were performed following the [documentation for the *R* package **Monocle**](http://cole-trapnell-lab.github.io/monocle-release/docs/).
+
+
+### Seurat preprocessing step
+- Determine filter criteria based on cell/gene count distributions.
+```{r Seurat-preprocessing-1}
+# Load data
+fls <- list.files("../data", recursive = T, full.names = T,
+                  pattern = "out_gene_exon_tagged_cleaned.dge.txt.gz")
+dat <- read.table(fls, header = T, row.names = 1) 
+
+
+# Load canonical marker genes
+cmGenes <- read.csv("../data/CellTypes-MarkerGenes.csv", header = T, fill = T, stringsAsFactors = F)
+cmGenes <- as.list(cmGenes[,-1])
+cmGenes <- lapply(cmGenes, function(x) x[x != ""])
+
+
+# Tabulate canonical marker gene expression
+tbl <- stack(cmGenes)
+colnames(tbl) <-  c("geneID","cellType")
+tbl <- do.call(cbind, list(tbl, nCells = rowSums(dat[tbl$geneID,] > 0),
+                           meanCts = rowMeans(replace(dat[tbl$geneID,], dat[tbl$geneID,] == 0, NA), 
+                                              na.rm = T))
+                           )
+rownames(tbl) <- NULL
+saveRDS(tbl, file = "../results/cmGeneTbl.Rds")
+
+
+# Display nGenes and nCells distribution across cells
+png("../results/fig/rawDataDistr.png", width = 12, height = 10, units = "in", res = 300)
+par(mfcol = c(2,1), mar = c(5.1, 4.1, 1.1, 1.1))
+hist(log2(colSums(dat > 0)), "fd", xlab = expression("log"[2]*"(nGenes per cell)"), main = "")
+hist(log2(rowSums(dat > 0)), "fd", xlab = expression("log"[2]*"(nCells per gene)"), main = "")
+dev.off()
+
+```
+
+![](../results/fig/rawDataDistr.png)
+
+#Doesn't run
+```{r cmGeneTbl, eval=T}
+tbl <- readRDS("../results/cmGeneTbl.Rds")
+
+# Display table
+datatable(tbl, 
+          extensions = c('FixedColumns','Buttons'),
+          options = list(columnDefs = list(list(className = 'dt-right', targets = 1:ncol(tbl)),
+                                           list(className = 'dt-center', targets = 0)),
+                         scrollX = TRUE, scrollY = FALSE, paging = TRUE,
+                         dom = 'Blfrtip', lengthMenu = seq(10, 10*ceiling(nrow(tbl)/10), 10),
+                         buttons = c('copy','excel','print'),
+                         fixedColumns = list(leftColumns = 0, rightColumns = 0))) %>%
+  formatRound(grep("meanCts", colnames(tbl), value = T), digits = 2) %>%
+  formatStyle(colnames(tbl), `font-size` = '13px') %>%
+  formatStyle(0, `white-space` = 'nowrap', fontWeight = 'bold')
+```
+\
+\
+
+
+```{r Seurat-preprocessing-2}
+# Generate Seurat class object from data passing filter criteria
+dat <- CreateSeuratObject(raw.data = dat, min.cells = 30, min.genes = 300,
+                          project = gsub(".+data/(.+)/.+", "\\1", fls))
+
+
+# Get % of UMI mapping to MT-genes; mouse MT-genes were taken from the Mitocarta website
+mito.genes <- readxl::read_excel("../data/Mouse.MitoCarta2.0.xlsx", 
+                                 sheet = "A Mouse MitoCarta2.0")
+mito.genes <- mito.genes[c("Symbol","Synonyms")]
+mito.genes <- unlist(strsplit(unlist(mito.genes, use.names = F), "\\|"))
+mito.genes <- rownames(dat@data)[rownames(dat@data) %in% mito.genes]
+percent.mito <- colSums(dat@data[mito.genes,])/colSums(dat@data)
+
+
+#Add percent.mito to dat@meta.data then plot distributions
+dat <- AddMetaData(dat, percent.mito, "percent.mito")
+
+
+# Plot meta data against each other
+png("../results/fig/GenePlot.png", width = 12, height = 6, units = "in", res = 300)
+par(mfrow = c(1,2))
+GenePlot(dat, "nUMI", "percent.mito")
+GenePlot(dat, "nUMI", "nGene")
+dev.off()
+
+```
+
+![](../results/fig/GenePlot.png)
+\
+\
+
+
+- Prepare data prior for principal component analysis.
+    - Filter out cells based on thresholds for UMI and % mitochodrial genes.
+    - Perform log-normalization.
+    - Center and scale gene expression.
+    - Compute gene expression dispersions.
+- Display average/dispersion relationships for thresholded genes.
+```{r Seurat-preprocessing-3}
+# Define gates for filtering
+dat <- FilterCells(dat, subset.names = c("nUMI", "percent.mito"),
+                   low.thresholds = c(200,0), high.thresholds = c(3000,0.1))
+
+
+# Perform log-normalization
+dat <- NormalizeData(dat)
+
+
+# Regress out unwanted sources of variation
+dat <- ScaleData(dat, vars.to.regress = c("nUMI", "percent.mito"))
+
+#cell count after filtering
+nrow(dat@meta.data)
+
+# Calculate gene dispersions
+png("../results/fig/VariableGenePlot.png", width = 12, height = 6, units = "in", res = 300)
+dat <- FindVariableGenes(dat, mean.function = ExpMean, dispersion.function = LogVMR,
+                         x.low.cutoff = 0.0125, x.high.cutoff = 3,
+                         y.cutoff = 0.5, y.high.cutoff = 6, do.plot = T)
+dev.off()
+
+```
+
+![](../results/fig/VariableGenePlot.png)
+\
+\
+
+
+- Perform linear dimensional reduction.
+```{r Seurat-preprocessing-4}
+# Run and visualize PCA results a few different ways
+dat <- RunPCA(dat, pc.genes = dat@var.genes, do.print = F, pcs.compute = 30)
+
+png("../results/fig/VizPCA.png", width = 15, height = 6, units = "in", res = 300)
+plot_grid(
+  DimPlot(dat, reduction.use = "pca", pt.size = 0.8, no.legend = T, do.return = T),
+  VlnPlot(dat, features.plot = "PC1", do.return = T, point.size.use = 0.5),
+  VlnPlot(dat, features.plot = "PC2", do.return = T, point.size.use = 0.5),
+  ncol = 3
+)
+dev.off()
+
+```
+
+![](../results/fig/VizPCA.png)
+\
+\
+
+
+- Show top genes associated with principal components
+```{r Seurat-preprocessing-5}
+# Show top 10 +/- genes ranked by PC scores 
+png("../results/fig/PCAPlot.png", width = 12, height = 6, units = "in", res = 300)
+VizDimReduction(dat, reduction.type = "pca", dims.use = 1:2, num.genes = 30, do.balanced = T)
+dev.off()
+
+```
+
+![](../results/fig/PCAPlot.png)
+\
+\
+
+
+- Determine PC dimensions to keep for downstream analysis.
+```{r Seurat-preprocessing-6}
+# Generate heatmaps of PCA results
+png("../results/fig/PCHeatmap.png", width = 12, height = 6, units = "in", res = 300)
+suppressWarnings(
+  PCHeatmap(dat, pc.use = 1, cells.use = 500, do.balanced = TRUE, label.columns = FALSE,
+            dendrogram = "none", lwid = c(0.25,0.75), margins = c(1,7), 
+            key.par = list(mar = c(4.1,3.1,4.1,1.1)))
+)
+dev.off()
+
+png("../results/fig/PCHeatmaps.png", width = 12, height = 30, units = "in", res = 300)
+PCHeatmap(dat, pc.use = 1:30, cells.use = 500, do.balanced = TRUE, label.columns = FALSE)
+dev.off()
+
+```
+
+![](../results/fig/PCHeatmap.png)
+
+<div class="scroll">
+![](../results/fig/PCHeatmaps.png)
+</div>
+\
+\
+
+
+```{r Seurat-preprocessing-7}
+# Look for statistically significant PCs
+dat <- JackStraw(dat, num.replicate = 100, num.pc = 30)
+
+jsplt <- JackStrawPlot(dat, PCs = 1:30)
+
+png("../results/fig/JackStrawPlot.png", width = 12, height = 15, units = "in", res = 300)
+print(jsplt)
+dev.off()
+
+png("../results/fig/PCElbowPlot.png", width = 12, height = 6, units = "in", res = 300)
+PCElbowPlot(dat, num.pc = 30)
+dev.off()
+
+```
+
+<div class="scroll">
+![](../results/fig/JackStrawPlot.png)
+</div>
+
+</br>
+
+![](../results/fig/PCElbowPlot.png)
+\
+\
+
+
+```{r Seurat-preprocessing-8}
+# Cluster cells
+sigPCs <- function(JackStrawPlot_object, threshold = 0.05) {
+    pc <- strsplit(gsub("^PC", "",as.character(unique(JackStrawPlot_object$data$PC.Score))),
+                   split = " ")
+    pc <- data.frame(PC = as.numeric(sapply(pc, "[[", 1)), 
+                     pval = as.numeric(sapply(pc, "[[", 2), stringsAsFactors = F))
+    
+    return(pc[which(pc$pval <= threshold), "PC"])
+}
+
+pca.dims <- sigPCs(jsplt, threshold = 0.001) #method for determining significant PCA dimensions in Seurat v2.2.1
+
+
+dat <- RunTSNE(dat, dims.use = pca.dims, do.fast = T)
+dat <- FindClusters(dat, reduction.type = "pca", dims.use = pca.dims, resolution = c(0.6,0.8,1,1.25,1.5),
+                    print.output = F, save.SNN = T, random.seed = 1234, force.recalc = F)
+
+
+# Specify the resolution to view clustered data in
+orig.id <- "res.0.6"
+dat <- SetAllIdent(dat, id = orig.id)
+
+
+png("../results/fig/TSNEPlot.png", width = 6, height = 4, units = "in", res = 300)
+TSNEPlot(dat, do.label = T, pt.size = 0.5, colors.use = c("darkkhaki", "lightpink2", "darkolivegreen3", "palegreen2", "gray", "tan","cyan", "orange","cyan2", "brown 1", "chartreuse3","mediumorchid1", "cyan3", "darkorange3"))
+dev.off()
+
+
+```
+
+
+```{r Seurat-preprocessing-9 }
+# Plot with updated cell markers
+# Microglial
+png("../results/fig/MicroGeneralGene.Plot.png", width = 9, height =9, units = "in", res = 300)
+FeaturePlot(object = dat, features.plot = c("Cx3cr1","P2ry12","Egr1","Csf1r","Hexb","Siglech", "Ctsd", "Fcrls", "Gpr34", "Gpr84", "P2ry13", "Cx3cr1","P2ry12","Tmem119","Csf1r","Hexb"), min.cutoff = "q9", cols.use = c("lightgrey", "blue"), pt.size = 0.7)
+dev.off()
+
+# Microglial
+png("../results/fig/custom/Micro_Cluster9.png", width = 14, height =2, units = "in", res = 300)
+FeaturePlot(object = dat, features.plot =c( "Cx3cr1","P2ry12","Egr1", "Atf3","Il1b","Il1a","Ccl4"), min.cutoff = "q9", cols.use = c("light grey", "blue"), pt.size = 0.7, nCol = 7)
+dev.off()
+
+# Microglial
+png("../results/fig/custom/Micro_2mWtBrSuppFig.png", width = 16, height =8, units = "in", res = 300)
+FeaturePlot(object = dat, features.plot =c( "Cx3cr1","P2ry12","Tmem119","Hexb","Ctsd","Csf1r","Rps11","Rps21","Rpl26","Rgs10","Gpr34","Maf","Atf3","Egr1","Fos","Btg2","Nfkbiz","Ccl4","Cd83","Cd14","Il1a","Il1b","Nlrp3", "Ccl12","Ifit3","Ifit2"), min.cutoff = "q9", cols.use = c("light grey", "blue"), pt.size = 0.7, nCol = 7)
+dev.off()
+
+# Microglial
+png("../results/fig/custom/Micro_Cluster9.png", width = 15, height =8, units = "in", res = 300)
+FeaturePlot(object = dat, features.plot =c( "Egr1", "Fos", "Atf3","Jun","Il1b","Il1a","Cd83", "Ccl4", "Btg2", "Socs3", "Ccrl2"), min.cutoff = "q9", cols.use = c("light grey", "blue"), pt.size = 0.7, no.legend = FALSE)
+dev.off()
+
+# Microglial
+png("../results/fig/custom/Micro--.Plot.png", width = 12, height=12, units = "in", res = 300)
+FeaturePlot(object = dat, features.plot = c("Cd83","Atf3","Nfkbiz","Egr1","Btg2","Ccl4","Il1a","Cd14","Ccl3","Il1b","Ccl12","Nlrp3","Ifrd1","Ier2","Plek","C5ar1","Cd14", "Marcksl1", "C3ar1", "Gpr84", "Casp4"), min.cutoff = "q9", cols.use = c("lightgrey", "blue"), pt.size = 0.5)
+dev.off()
+
+# Microglial
+png("../results/fig/custom/Micro-DAM.Plot.png", width = 12, height =9, units = "in", res = 300)
+FeaturePlot(object = dat, features.plot = c("H2-Ab1","Igf1","Csf1","Axl","Lpl", "Cd74","Trem2"), min.cutoff = "q9", cols.use = c("lightgrey", "blue"), pt.size = 0.5)
+dev.off()
+
+
+png("../results/fig/custom/VlnPlot-Microglia.png", width = 15, height = 1.5, units = "in", res = 300)
+VlnPlot(object=dat, point.size.use = 0, features.plot=c("Cx3cr1","P2ry12","Tmem119"), cols = c("darkkhaki", "lightpink2", "darkolivegreen3", "palegreen2", "gray", "tan","cyan", "orange","cyan2", "brown 1", "chartreuse3","mediumorchid1", "cyan3", "darkorange3" ))
+dev.off()
+
+
+```
+
+![](../results/fig/TSNEPlot.png)
+
+```{r }
+
+#### test.use="MAST"
+# find markers for every cluster compared to all remaining cells, report # only the positive ones
+dat_MAST.markers <- FindAllMarkers(dat, only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25,
+                              test.use = "MAST", return.thresh = 0.05)
+row.names(dat_MAST.markers) <- NULL
+
+#write.csv(dat_MAST.markers, file = "../results/dat_MAST.markers.csv")
+#Save at a different return threshold of 0.05 
+write.csv(dat_MAST.markers, file = "../results/dat_MAST.markers.0.05.csv")
+
+```
+
+
+# Cluster characterization
+
+- Highlight canonical marker expression across clusters.
+```{r Seurat-clusterChar-1}
+# Load canonical marker genes
+cmGenes <- read.csv("../data/CellTypes-MarkerGenes.csv", header = T, fill = T, stringsAsFactors = F)
+cmGenes <- as.list(cmGenes[,-1])
+cmGenes <- lapply(cmGenes, function(x) x[x != ""])
+
+# Show all cells expressing a canonical marker gene except the lower 10% (min.cutoff = "q9")
+local(
+  for (i in names(cmGenes)) {
+    g <- intersect(cmGenes[[i]], rownames(dat@data))
+    if (length(g) == 0) next  # skip if feature set is empty
+    
+    p <- FeaturePlot(dat, features.plot = g, min.cutoff = "q9", cols.use = c("lightgrey","blue"), 
+                     pt.size = 0.5, do.return = T)
+    
+    png(paste0("../results/fig/FeaturePlot-", i, ".png"), 
+        height = 3.2*(1 + (length(p) - 1) %/% 3) + 0.5, width = 9.5, units = "in", res = 300)
+    print(
+      plot_grid(
+        ggdraw() + draw_label(gsub(".", " ", i, fixed = T), 
+                              fontface = "bold", colour = "red4", size = 24),
+        plot_grid(plotlist = p, ncol = 3), 
+        ncol = 1, rel_heights = c(0.5,3.3*(1 + (length(p) - 1) %/% 3))
+      )
+    )
+    dev.off()
+    
+  }
+)
+
+```
+
+```{r echo=FALSE, eval=TRUE, results='asis'}
+for (i in list.files("../results/fig/", pattern = "FeaturePlot", full.names = T)) {
+  cat("<div class='scroll'> ![](", i, ") </div> <br>")
+}
+```
+\
+\
+
+
+- Display detected canonical gene markers across clusters (p-value < 0.01)
+    - **avg_logFC**: difference in the natural logarithm of mean gene expression between pct.1 and pct.2
+    - **pct.1**: fraction of cells in the cluster of interest with gene expression > 0
+    - **pct.2**: fraction of cells in the other clusters combined with gene expression > 0
+```{r Seurat-clusterChar-2}
+# Load canonical marker genes
+cmGenes <- read.csv("../data/CellTypes-MarkerGenes.csv", header = T, fill = T, stringsAsFactors = F)
+cmGenes <- as.list(cmGenes[,-1])
+cmGenes <- lapply(cmGenes, function(x) x[x != ""])
+
+
+# Remove canonical gene markers not present in the Serat-processed dataset 
+cmGenes <- setNames(stack(cmGenes), c("gene","celltype"))
+cmGenes <- cmGenes[cmGenes$gene %in% rownames(dat@data),]
+cmGenes$celltype <- gsub(".", " ", cmGenes$celltype, fixed = T)
+
+# Determine stats for canonical gene markers
+dat.markers <- FindAllMarkers(dat, genes.use = cmGenes$gene, only.pos = T, test.use = "MAST", 
+                              logfc.threshold = 0.05, return.thresh = 0.01, do.print = T)
+
+dat.markers <- merge(dat.markers, cmGenes, by = "gene", all.x = T, sort = F)
+dat.markers <- dat.markers[order(dat.markers$cluster),]
+
+write.csv(dat.markers, file = "../results/dat.markers-canonical.csv")
+
+# Determine stats for all gene markers
+dat.markers <- FindAllMarkers(dat, genes.use = NULL, only.pos = T, test.use = "MAST", 
+                              logfc.threshold = 0.05, return.thresh = 0.01, do.print = T)
+
+dat.markers <- merge(dat.markers, cmGenes, by = "gene", all.x = T, sort = F)
+dat.markers <- dat.markers[order(dat.markers$cluster),]
+
+write.csv(dat.markers, file = "../results/dat.markers-allgenes.csv")
+
+```
+
+```{r eval=T}
+dat.markers <- read.csv("../results/dat.markers-canonical.csv", header = T, row.names = 1,
+                        stringsAsFactors = F)
+
+tbl <- reshape(dat.markers, direction = "wide", idvar = "gene", timevar = "cluster", 
+               drop = c("p_val","p_val_adj"), v.names = c("avg_logFC","pct.1","pct.2"))
+rownames(tbl) <- tbl[[1]]
+tbl <- tbl[-1]
+
+
+sketch <- htmltools::withTags(table(
+  class = 'display',
+  thead(
+    tr(
+      th(rowspan = 2, ""),
+      th(rowspan = 2, "celltype"),
+      lapply(paste0("Cluster ", unique(dat.markers$cluster)), th, colspan = 3)
+    ),
+    tr(
+      lapply(gsub("(^.*)\\..*", "\\1", colnames(tbl))[-1], th)
+    )
+  )
+))
+
+
+datatable(tbl, container = sketch,
+          extensions = c('FixedColumns','Buttons'),
+          options = list(columnDefs = list(list(className = 'dt-right', targets = 1:ncol(tbl)),
+                                           list(className = 'dt-center', targets = 0)),
+                         scrollX = TRUE, scrollY = '370px', paging = TRUE, scrollCollapse = TRUE,
+                         dom = 'Blfrtip', lengthMenu = seq(10, 10*ceiling(nrow(tbl)/10), 10),
+                         buttons = c('copy','excel','print'),
+                         fixedColumns = list(leftColumns = 2, rightColumns = 0))) %>%
+  formatRound(colnames(tbl), digits = 2) %>%
+  formatStyle(colnames(tbl), `font-size` = '13px') %>%
+  formatStyle(0, `white-space` = 'nowrap', fontWeight = 'bold') %>%
+  formatStyle(colnames(tbl), `white-space` = 'nowrap')
+
+```
+\
+\
+
+
+- Map out canonical marker gene distribution across all clusters
+```{r Seurat-clusterChar-3}
+# Create combined violin plots 
+combinedVionlinPlots <- function(dat, genes.use, labels = NULL, label_x = 0.95, label_y = 0.7, 
+                                 hjust = 0, vjust = 1.5, label_size = 18, label_fontface = 1, 
+                                 bar_width = 0.192, rel_heights = NULL) {
+  vlnplts <- setNames(vector("list", length(genes.use)), genes.use)
+  for (i in genes.use) {
+    vlnplts[[i]] <- VlnPlot(dat, features.plot = i, point.size.use = -1, same.y.lims = T) + 
+      theme(aspect.ratio = 0.1,
+            axis.title.x = element_blank(), axis.text.x = element_blank(), 
+            axis.ticks.x = element_blank(), 
+            axis.title.y = element_text(angle = 0, color = "black", size = 20, hjust = 1), 
+            axis.text.y = element_blank(), axis.line = element_blank(),
+            plot.margin = unit(c(0,0,0,0), "cm"),
+            plot.title = element_blank()) +
+      ylab(i)
+  }
+  
+  maxExprs <- sapply(genes.use, function(i) sprintf("%2.2f", round(max(dat@data[i,]), 2)))
+  
+  g <- ggplot_build(vlnplts[[1]])
+  x <- if (is.null(labels)) paste0("Cluster ", as.numeric(levels(dat@ident))) else labels
+  x <- factor(x, levels = x)
+  
+  g <- ggplot(data = data.frame(x = x, y = 100), aes(x = x, y = y)) + 
+        geom_bar(stat = "identity",  fill = unlist(unique(g$data[[1]]["fill"]), use.names = F)) +
+        theme(aspect.ratio = bar_width,
+              axis.title = element_blank(), axis.text = element_blank(), 
+              axis.ticks = element_blank(), axis.line = element_blank(),
+              plot.margin = unit(c(-2,2,-2,0.1), "cm"),
+              plot.title = element_blank()) +
+        annotate("text", x = x, y = 2.5, label = x, angle = 90, hjust = 0,
+                 size = 6, fontface = "bold")
+  
+  plot_grid(plotlist = c(list(g), vlnplts[genes.use]), ncol = 1, align = "v", 
+            labels = c("",maxExprs), label_x = label_x, label_y = label_y, hjust = hjust, vjust = vjust,
+            label_size = label_size, label_fontface = label_fontface, 
+            rel_heights = if (is.null(rel_heights)) 
+                          c(2,rep(1, length(genes.use))) else c(rel_heights,rep(1, length(genes.use)))
+            )
+}
+
+
+# Uncomment and run to use previous cluster labels
+dat <- SetAllIdent(dat, id = orig.id)
+
+
+# Adjust width/height arguments in png to refit objects in the plot
+# Maximum gene expression displayed on the plot's right-hand-side
+# Replace genes.use argument with custom set of genes if desired
+# Rule of thumb: The correct height to set should be close to 2.5 + 1.1 * no. of genes
+png("../results/fig/vlnplts.png", width = 13, height = 54, units = "in", res = 300)
+combinedVionlinPlots(dat, genes.use = cmGenes$gene)
+dev.off()
+
+
+# Finalize cluster group names (cluster names need to be specified HERE; arrange by cluster sequence)
+new.ident <- c("Microglia","VSMC/Ng2 cell","Microglia","Astrocyte","Pericyte/Ng2 cell",
+               "Oligodendrocyte/Astrocyte","Neural stem cell","Macrophage","Neuron/Neural stem cell",
+               "Microglia","Endothelia","B cell","Neuron/Neural stem cell","Ependymocyte/Astrocyte")
+
+
+# Perform cluster relabeling
+dat@ident <- plyr::mapvalues(x = dat@ident, from = levels(dat@ident), to = new.ident)
+
+# View current cluster IDs
+show(levels(dat@ident))
+
+# Uncomment and adjust cluster group names to be used as labels in combined violinplots
+labels <- c("Microglia","VSMC/Ng2 cell","Astrocyte","Pericyte/Ng2 cell",
+            "Oligo/Astro","Neural stem cell","Macrophage","Neuron/Neural stem cell",
+            "Endothelia","B cell","Ependy/Astro")
+
+
+# Adjust width/height arguments in png to refit objects in the plot
+# Maximum gene expression displayed on the plot's right-hand-side
+# Replace genes.use argument with custom set of genes if desired
+# Rule of thumb: The correct height to set should be close to 2.5 + 1.1 * no. of genes
+png("../results/fig/vlnplts-ID.png", width = 13, height = 54, units = "in", res = 300)
+combinedVionlinPlots(dat, genes.use = cmGenes$gene, labels = labels, bar_width = 0.3, rel_heights = 3)
+dev.off()
+```
+
+► By cluster ID
+<div class='scroll'> 
+![](../results/fig/vlnplts.png) 
+</div>
+<br/>
+<br/>
+
+► By cell type
+<div class='scroll'> 
+![](../results/fig/vlnplts-ID.png) 
+</div>
+\
+\
+
+
+```{r echo=F}
+save.image("../results/savedImage.Rdata")
+```
+\
+\
+
+
+- Validate canonical gene markers in identified cell types
+    - **avg_logFC**: difference in the natural logarithm of mean gene expressions between pct.1 and pct.2
+    - **pct.1**: fraction of cells in the cluster of interest with gene expression > 0
+    - **pct.2**: fraction of cells in the other clusters combined with gene expression > 0
+```{r Seurat-clusterChar-4}
+# Determine stats for canonical gene markers
+dat.markers <- FindAllMarkers(dat, genes.use = cmGenes$gene, only.pos = T, test.use = "MAST", 
+                              logfc.threshold = 0.05, return.thresh = 0.01, do.print = T)
+
+dat.markers <- merge(dat.markers, cmGenes, by = "gene", all.x = T, sort = F)
+dat.markers <- dat.markers[order(dat.markers$cluster),]
+
+write.csv(dat.markers, file = "../results/dat.markers-canonical-ID.csv")
+
+```
+
+```{r eval=T}
+dat.markers <- read.csv("../results/dat.markers-canonical-ID.csv", 
+                        header = T, row.names = 1, stringsAsFactors = F)
+
+tbl <- reshape(dat.markers, direction = "wide", idvar = "gene", timevar = "cluster", 
+               drop = c("p_val","p_val_adj"), v.names = c("avg_logFC","pct.1","pct.2"))
+rownames(tbl) <- tbl[[1]]
+tbl <- tbl[-1]
+
+
+sketch <- htmltools::withTags(table(
+  class = 'display',
+  thead(
+    tr(
+      th(rowspan = 2, ""),
+      th(rowspan = 2, "celltype"),
+      lapply(unique(dat.markers$cluster), th, colspan = 3)
+    ),
+    tr(
+      lapply(gsub("(^.*)\\..*", "\\1", colnames(tbl))[-1], th)
+    )
+  )
+))
+
+
+datatable(tbl, container = sketch,
+          extensions = c('FixedColumns','Buttons'),
+          options = list(columnDefs = list(list(className = 'dt-right', targets = 1:ncol(tbl)),
+                                           list(className = 'dt-center', targets = 0)),
+                         scrollX = TRUE, scrollY = '370px', paging = TRUE, scrollCollapse = TRUE,
+                         dom = 'Blfrtip', lengthMenu = seq(10, 10*ceiling(nrow(tbl)/10), 10),
+                         buttons = c('copy','excel','print'),
+                         fixedColumns = list(leftColumns = 2, rightColumns = 0))) %>%
+  formatRound(colnames(tbl), digits = 2) %>%
+  formatStyle(colnames(tbl), `font-size` = '13px') %>%
+  formatStyle(0, `white-space` = 'nowrap', fontWeight = 'bold') %>%
+  formatStyle(colnames(tbl), `white-space` = 'nowrap')
+
+```
+\
+\
+
+
+- Tabulate cell frequencies in each cluster across datasets.
+```{r cellFreq, eval=T}
+load("../results/savedImage.Rdata")
+
+# Compute cell frequencies across 
+tbl <- table(dat@ident, factor(dat@meta.data[,orig.id], 
+                               levels = sort(as.numeric(unique(dat@meta.data[,orig.id])))))
+tbl <- addmargins(tbl, margin = 2)
+tbl <- cbind(tbl, Pct = 100*tbl[,"Sum"]/sum(tbl[,"Sum"]))
+
+# Display table of frequencies across datasets
+datatable(tbl, 
+          extensions = c('FixedColumns','Buttons'),
+          options = list(columnDefs = list(list(className = 'dt-right', targets = 1:ncol(tbl)),
+                                           list(className = 'dt-center', targets = 0)),
+                         scrollX = TRUE, scrollY = FALSE, paging = TRUE, pageLength = nrow(tbl),
+                         dom = 'Blfrtip', lengthMenu = seq(10, 10*ceiling(nrow(tbl)/10), 10),
+                         buttons = c('copy','excel','print'),
+                         fixedColumns = list(leftColumns = 1, rightColumns = 2))) %>%
+  formatRound(grep("Pct", colnames(tbl), value = T), digits = 2) %>%
+  formatStyle(colnames(tbl), `font-size` = '13px') %>%
+  formatStyle(0, `white-space` = 'nowrap', fontWeight = 'bold')
+
+```
+\
+\
+
+
+- Create correlogram of canonical gene markers.
+```{r corrPlot}
+# Replace with custom gene set if desired, ex. genes.use <- c("gene1, gene2","etc.") 
+genes.use <- unique(cmGenes$gene)
+
+# Generate corrplot 
+corMat <- cor(t(as.matrix(dat@data)[genes.use,]))
+
+png("../results/fig/corrplot.png", width = 12, height = 12, units = "in", res = 300, pointsize = 20)
+corrplot(corMat, method = "color", col = rev(brewer.pal(11, "RdGy")), tl.col = "blue4",
+         order = "original", tl.cex = 0.6, mar = c(1,0,0,0))
+dev.off()
+
+```
+
+<center>
+![](../results/fig/corrplot.png){width=85%}
+</center>
+
+\
+\
+
+
+### Differential gene expression analysis
+
+- Determine all differentially expressed genes (saved in *results* as *dat.markers-allgenes-ID.csv*).
+    - Display summary of stats per cell type.
+```{r Seurat-dge-1}
+# Determine differentially expressed genes
+dat.markers <- FindAllMarkers(dat, genes.use = NULL, only.pos = T, test.use = "MAST", 
+                              logfc.threshold = 0.05, return.thresh = 0.01, do.print = T)
+write.csv(dat.markers, file = "../results/dat.markers-allgenes-ID.csv")
+
+```
+
+```{r eval=T}
+tbl <- read.csv("../results/dat.markers-allgenes-ID.csv", header = T, row.names = 1, 
+                stringsAsFactors = F)
+tbl <- data.frame(aggregate(tbl[,sapply(tbl, is.numeric)], list(cluster = tbl$cluster), summary),
+                  list(nDEGs. = as.vector(table(tbl$cluster))))
+
+names(tbl) <- paste0(names(tbl), ".")
+
+tbl <- do.call(data.frame, tbl)
+rownames(tbl) <- tbl$cluster
+tbl <- tbl[levels(dat@ident),-1]
+
+
+
+sketch <- htmltools::withTags(table(
+  class = 'display',
+  thead(
+    tr(
+      th(rowspan = 2, ""),
+      lapply(unique(gsub("(.*)\\.\\..*$", "\\1", colnames(tbl)[1:(ncol(tbl) - 1)])), th, colspan = 6),
+      th(rowspan = 2, gsub("(.*)\\.\\..*$", "\\1", colnames(tbl)[ncol(tbl)]))
+    ),
+    tr(
+      lapply(gsub(".*\\.\\.(.*)$", "\\1", colnames(tbl)[1:(ncol(tbl) - 1)]), th)
+    )
+  )
+))
+
+
+# Display table of summaries across datasets
+datatable(tbl, container = sketch,
+          extensions = c('FixedColumns','Buttons'),
+          options = list(columnDefs = list(list(className = 'dt-right', targets = 1:ncol(tbl)),
+                                           list(className = 'dt-center', targets = 0)),
+                         scrollX = TRUE, scrollY = FALSE, paging = TRUE, pageLength = nrow(tbl),
+                         dom = 'Blfrtip', lengthMenu = seq(10, 10*ceiling(nrow(tbl)/10), 10),
+                         buttons = c('copy','excel','print'),
+                         fixedColumns = list(leftColumns = 1, rightColumns = 1))) %>%
+  formatSignif(head(which(sapply(tbl, is.numeric)), -1), digits = 2) %>%
+  formatRound(tail(which(sapply(tbl, is.numeric)), 1), digits = 0) %>%
+  formatStyle(colnames(tbl), `white-space` = 'nowrap', `font-size` = '13px') %>%
+  formatStyle(0, `white-space` = 'nowrap', fontWeight = 'bold')
+
+```
